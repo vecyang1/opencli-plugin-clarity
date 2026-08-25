@@ -1,0 +1,10 @@
+{
+  "name": "opencli-plugin-clarity",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenCLI adapter for Microsoft Clarity project settings — the surface Clarity has no API for.",
+  "license": "AGPL-3.0-or-later",
+  "repository": { "type": "git", "url": "git+https://github.com/vecyang1/opencli-clarity.git" },
+  "keywords": ["opencli", "microsoft-clarity", "analytics", "google-analytics", "gtm"],
+  "peerDependencies": { "@jackwener/opencli": ">=1.8.6" }
+}

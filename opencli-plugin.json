@@ -1,0 +1,6 @@
+{
+  "name": "clarity",
+  "version": "0.1.0",
+  "description": "Read Microsoft Clarity project settings (GA/GTM/Ads integration status) and per-project traffic across a whole account.",
+  "opencli": ">=1.8.6"
+}
