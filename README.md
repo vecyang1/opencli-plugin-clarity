@@ -1,4 +1,4 @@
-# opencli-clarity
+# opencli-plugin-clarity
 
 An [OpenCLI](https://github.com/jackwener/OpenCLI) adapter that reads Microsoft
 Clarity's **project settings** — the integration status for Google Analytics,
@@ -13,7 +13,7 @@ in to. **Read-only: nothing here connects, disconnects or changes anything.**
 ## Install
 
 ```bash
-opencli plugin install github:vecyang1/opencli-clarity
+opencli plugin install github:vecyang1/opencli-plugin-clarity
 ```
 
 Or copy the `.js` files into `~/.opencli/clis/clarity/` by hand — that is the
