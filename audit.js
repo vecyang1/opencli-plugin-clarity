@@ -3,7 +3,7 @@ import { discoverProjects, gotoClaritySettings, normalizeProjectId, readIntegrat
 
 const DEFAULT_REQUIRED = 'Google Analytics,Google Tag Manager';
 
-function statusOf(cards, name) {
+export function statusOf(cards, name) {
   const hit = cards.find((c) => c.name.toLowerCase() === name.toLowerCase());
   if (hit) return hit.status;
   // The panel finished painting and this card was not on it — Clarity does not
