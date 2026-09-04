@@ -165,11 +165,12 @@ recovered, swapping these commands to GraphQL would remove the page loads.
   card; navigation is a JS handler. Ids come from React fiber props, scanned
   over a **bounded** node set — an unbounded `querySelectorAll('*')` walk over
   this grid freezes the renderer.
-- `/projects` is hostile to automation. It dropped the OpenCLI bridge on
-  `navigate` several times, and froze the tab outright under Chrome-MCP CDP
-  (`Runtime.evaluate` timeout, renderer unresponsive). With an ephemeral session
-  and in-page waiting it completes. If it ever stops enumerating, fall back to
-  `--project-ids`.
+- `/projects` navigation is protected by `safeGoto`. Direct navigation to
+  `/projects` often triggers an SPA client redirect to the user's last-viewed
+  project dashboard (`/projects/view/<id>/dashboard`), and Chrome container
+  reuse can throw `Navigation rejected`. `safeGoto` recovers transparently
+  via in-page evaluation and new-tab fallback, and `discoverProjects` targets
+  the root `${CLARITY_ORIGIN}/` to boot directly into the full projects grid.
 - Clarity is usually installed **through GTM**, not as a static snippet, so you
   cannot recover a project id by fetching the site's HTML — none of 20 sites
   carried `clarity.ms/tag/<id>`.

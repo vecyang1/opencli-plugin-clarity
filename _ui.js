@@ -29,6 +29,50 @@ function ensureObject(value, label) {
   throw new CommandExecutionError(`${label} returned an unexpected payload shape from the Browser Bridge.`);
 }
 
+export async function safeGoto(page, url, options) {
+  try {
+    await page.goto(url, options);
+    return;
+  } catch (error) {
+    if (!/Navigation rejected/i.test(String(error?.message || error))) {
+      throw error;
+    }
+  }
+
+  // First fallback: if page context is available, navigate via location.href
+  try {
+    if (typeof page.evaluate === 'function') {
+      await page.evaluate(`location.href = ${JSON.stringify(url)}`);
+      return;
+    }
+  } catch {}
+
+  // Second fallback: close stale window and retry goto
+  if (typeof page.closeWindow === 'function') {
+    await page.closeWindow().catch(() => {});
+  }
+
+  try {
+    await page.goto(url, options);
+    return;
+  } catch (error) {
+    if (!/Navigation rejected/i.test(String(error?.message || error))) {
+      throw error;
+    }
+  }
+
+  // Third fallback: open a fresh tab explicitly
+  if (typeof page.newTab === 'function') {
+    const pageId = await page.newTab(url);
+    if (pageId && typeof page.setActivePage === 'function') {
+      await page.setActivePage(pageId);
+      return;
+    }
+  }
+
+  await page.goto(url, options);
+}
+
 /**
  * Navigate to a Clarity settings sub-tab and fail loudly when the profile is
  * signed out. The `cb` cache-buster forces a real document load: Clarity is a
@@ -40,7 +84,7 @@ export async function gotoClaritySettings(page, projectId, hash, label) {
     throw new CommandExecutionError(`${label} requires an OpenCLI Browser Bridge page with navigation and visible-DOM access.`);
   }
   const cb = `cb${projectId}`;
-  await page.goto(`${CLARITY_ORIGIN}/projects/view/${projectId}/settings?${cb}=1#${hash}`, { waitUntil: 'domcontentloaded' });
+  await safeGoto(page, `${CLARITY_ORIGIN}/projects/view/${projectId}/settings?${cb}=1#${hash}`, { waitUntil: 'domcontentloaded' });
 
   // Wait inside the page, not around it. `page.wait` is not available on every
   // bridge page object, and when it is missing an out-of-page poll spins
@@ -211,7 +255,7 @@ export async function readIntegrationCards(page) {
  * on a `load` wait, so commit early and poll the DOM until cards appear.
  */
 export async function discoverProjects(page) {
-  await page.goto(`${CLARITY_ORIGIN}/projects`, { waitUntil: 'commit' });
+  await safeGoto(page, `${CLARITY_ORIGIN}/`);
 
   let last = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -220,13 +264,13 @@ export async function discoverProjects(page) {
     // ids have to come from React's own props when the markup has none.
     const payload = await page.evaluate(`(async () => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      const deadline = Date.now() + 30000;
+      const deadline = Date.now() + 15000;
       let lines = [];
       while (Date.now() < deadline) {
         lines = String(document.body ? document.body.innerText || '' : '')
           .split('\\n').map((l) => l.trim()).filter(Boolean);
-        if (lines.length > 12) break;
-        await sleep(1000);
+        if (lines.length > 5) break;
+        await sleep(500);
       }
 
       const SITE = /^(?:https?:\\/\\/)?(?:www\\.)?[a-z0-9-]+(?:\\.[a-z0-9-]+)+(?:\\/\\S*)?$/i;
@@ -255,9 +299,12 @@ export async function discoverProjects(page) {
       // and a partial set is worse than none: the caller cannot tell 3-of-20
       // from 3-in-total, and reports the short list as the whole account.
       let htmlLen = 0, prev = -1, stable = 0;
-      const settleBy = Date.now() + 60000;
+      const settleBy = Date.now() + 15000;
       while (Date.now() < settleBy) {
         lines = readLines();
+        if (/sign in|log in|welcome to clarity/i.test(document.title + ' ' + lines.join(' '))) {
+          return { notSignedIn: true, href: location.href, title: document.title, ids: [], cardLines: 0, lines: [] };
+        }
         htmlLen = harvest();
         const cardLines = lines.filter((l) => SITE.test(l)).length;
         if (ids.size > 0 && ids.size === prev && ids.size >= cardLines) {
@@ -267,7 +314,7 @@ export async function discoverProjects(page) {
           stable = 0;
         }
         prev = ids.size;
-        await sleep(1500);
+        await sleep(800);
       }
 
       return {
@@ -280,6 +327,12 @@ export async function discoverProjects(page) {
       };
     })()`);
     last = payload;
+
+    if (payload?.notSignedIn) {
+      throw new CommandExecutionError(
+        'Clarity is not signed in in the selected Browser Bridge profile. Sign in at https://clarity.microsoft.com in that Chrome profile, then retry.',
+      );
+    }
 
     // A short list must never be returned as the whole account. If fewer ids
     // than rendered cards came back, treat the sample as incomplete and retry.

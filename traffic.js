@@ -1,6 +1,6 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { CommandExecutionError } from '@jackwener/opencli/errors';
-import { CLARITY_ORIGIN, discoverProjects, normalizeProjectId } from './_ui.js';
+import { CLARITY_ORIGIN, discoverProjects, normalizeProjectId, safeGoto } from './_ui.js';
 
 const DEFAULT_RANGE = 'Last 30 days';
 
@@ -15,7 +15,7 @@ const DEFAULT_RANGE = 'Last 30 days';
 async function readDashboard(page, projectId, range) {
   const url = `${CLARITY_ORIGIN}/projects/view/${projectId}/dashboard`
     + `?date=${encodeURIComponent(range)}&cb${projectId}=1`;
-  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await safeGoto(page, url, { waitUntil: 'domcontentloaded' });
 
   const out = await page.evaluate(`(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -101,7 +101,7 @@ async function readDashboard(page, projectId, range) {
 
 // "1,234" -> 1234. Anything that is not a plain count (an abbreviation, a dash,
 // an empty tile) returns null so it stays distinguishable from a measured zero.
-function toCount(raw) {
+export function toCount(raw) {
   const s = String(raw || '').trim().replace(/,/g, '');
   if (!/^\d+$/.test(s)) return null;
   return Number(s);
