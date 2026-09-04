@@ -24,17 +24,32 @@ export function normalizeProjectId(value, { required = true } = {}) {
   return id;
 }
 
+export function parseProjectIds(value) {
+  const explicit = String(value || '').trim();
+  if (!explicit) return [];
+  const parts = explicit.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!parts.length) {
+    throw new TypeError('project-ids must contain at least one valid project id.');
+  }
+  return parts.map((id) => normalizeProjectId(id));
+}
+
 function ensureObject(value, label) {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value;
   throw new CommandExecutionError(`${label} returned an unexpected payload shape from the Browser Bridge.`);
 }
 
-export async function safeGoto(page, url, options) {
+export function isRetriableNavigationError(error) {
+  const msg = String(error?.message || error);
+  return /Navigation rejected|Detached while handling command|Debugger is not attached|Target closed|Session closed/i.test(msg);
+}
+
+export async function safeGoto(page, url, options = { waitUntil: 'domcontentloaded' }) {
   try {
     await page.goto(url, options);
     return;
   } catch (error) {
-    if (!/Navigation rejected/i.test(String(error?.message || error))) {
+    if (!isRetriableNavigationError(error)) {
       throw error;
     }
   }
@@ -47,27 +62,27 @@ export async function safeGoto(page, url, options) {
     }
   } catch {}
 
-  // Second fallback: close stale window and retry goto
-  if (typeof page.closeWindow === 'function') {
-    await page.closeWindow().catch(() => {});
-  }
+  // Second fallback: wait for in-flight tab navigation to settle, then retry goto
+  await new Promise((r) => setTimeout(r, 600));
 
   try {
     await page.goto(url, options);
     return;
   } catch (error) {
-    if (!/Navigation rejected/i.test(String(error?.message || error))) {
+    if (!isRetriableNavigationError(error)) {
       throw error;
     }
   }
 
   // Third fallback: open a fresh tab explicitly
   if (typeof page.newTab === 'function') {
-    const pageId = await page.newTab(url);
-    if (pageId && typeof page.setActivePage === 'function') {
-      await page.setActivePage(pageId);
-      return;
-    }
+    try {
+      const pageId = await page.newTab(url);
+      if (pageId && typeof page.setActivePage === 'function') {
+        await page.setActivePage(pageId);
+        return;
+      }
+    } catch {}
   }
 
   await page.goto(url, options);
@@ -98,20 +113,22 @@ export async function gotoClaritySettings(page, projectId, hash, label) {
   const marker = hash === 'setup' ? 'Advanced settings' : '';
   const state = ensureObject(await page.evaluate(`(async () => {
     const marker = ${JSON.stringify(marker)};
-    const deadline = Date.now() + 20000;
+    const markerRe = marker ? new RegExp(marker, 'i') : null;
+    const deadline = Date.now() + 10000;
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     let text = '';
     while (Date.now() < deadline) {
       text = document.body ? (document.body.innerText || '') : '';
-      if (marker === '' ? text.trim().length > 0 : text.includes(marker)) break;
+      if (markerRe ? markerRe.test(text) : text.trim().length > 0) break;
       if (/sign in|log in|welcome to clarity/i.test(document.title + ' ' + text)) break;
-      await sleep(750);
+      if (/doesn't exist|don't have permissions|access denied|project not found/i.test(text)) break;
+      await sleep(500);
     }
     return {
       title: document.title || '',
       href: location.href,
       text: text.replace(/\\s+/g, ' ').trim().slice(0, 600),
-      waitedMs: 20000 - Math.max(0, deadline - Date.now()),
+      waitedMs: 10000 - Math.max(0, deadline - Date.now()),
       textContentLen: document.body ? String(document.body.textContent || '').length : -1,
     };
   })()`), label);
@@ -125,6 +142,11 @@ export async function gotoClaritySettings(page, projectId, hash, label) {
   if (/sign in|log in|welcome to clarity/i.test(`${state.title} ${state.text}`)) {
     throw new CommandExecutionError(
       'Clarity is not signed in in the selected Browser Bridge profile. Sign in at https://clarity.microsoft.com in that Chrome profile, then retry.',
+    );
+  }
+  if (/doesn't exist|don't have permissions|access denied|project not found/i.test(state.text)) {
+    throw new CommandExecutionError(
+      `NOT_FOUND: Clarity reported that project ${projectId} does not exist or this account lacks permissions to view it.`,
     );
   }
   // Clarity sends projects that have never received data to an onboarding
@@ -198,27 +220,26 @@ export async function readIntegrationCards(page) {
           connectedTo: valueAfter(body, 'Connected to:'),
         });
       }
-      return { cards, lines, complete: lines.includes('Advanced settings') };
+      const isComplete = lines.some((l) => /advanced settings/i.test(l))
+        || /advanced settings/i.test(document.body ? document.body.innerText || '' : '');
+      return { cards, lines, complete: isComplete };
     };
 
-    // Settle on the card count. The cards paint progressively and the
-    // "Advanced settings" block can appear BEFORE the last card lands — so
-    // end-marker-plus-one-card wrongly reported two present integrations as
-    // "not offered". Require the count to hold steady before trusting it.
+    // Settle on the card count. The cards paint progressively.
     let snap = parse();
     let prev = -1;
     let stable = 0;
-    const deadline = Date.now() + 25000;
+    const deadline = Date.now() + 12000;
     while (Date.now() < deadline) {
       snap = parse();
-      if (snap.complete && snap.cards.length > 0 && snap.cards.length === prev) {
+      if (snap.cards.length > 0 && (snap.complete || stable >= 1) && snap.cards.length === prev) {
         stable += 1;
         if (stable >= 2) break;
       } else {
         stable = 0;
       }
       prev = snap.cards.length;
-      await sleep(1200);
+      await sleep(800);
     }
 
     return {
@@ -251,81 +272,105 @@ export async function readIntegrationCards(page) {
 /**
  * Enumerate every project on the account from the /projects grid.
  *
- * The grid is heavy enough to blow OpenCLI's hardcoded 120s per-action ceiling
- * on a `load` wait, so commit early and poll the DOM until cards appear.
+ * Each project card on the Clarity grid carries `data-clarity-id="projectClicked_<id>"`,
+ * binding the exact project ID, friendly name, and site URL deterministically.
  */
 export async function discoverProjects(page) {
-  await safeGoto(page, `${CLARITY_ORIGIN}/`);
+  await safeGoto(page, `${CLARITY_ORIGIN}/projects`, { waitUntil: 'domcontentloaded' });
 
   let last = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    // Wait inside the page — see gotoClaritySettings for why an out-of-page
-    // poll is unreliable here. The grid also carries no <a href> per card, so
-    // ids have to come from React's own props when the markup has none.
-    const payload = await page.evaluate(`(async () => {
+    let payload;
+    try {
+      payload = await page.evaluate(`(async () => {
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       const deadline = Date.now() + 15000;
-      let lines = [];
-      while (Date.now() < deadline) {
-        lines = String(document.body ? document.body.innerText || '' : '')
-          .split('\\n').map((l) => l.trim()).filter(Boolean);
-        if (lines.length > 5) break;
-        await sleep(500);
+
+      // If SPA redirected to a specific project dashboard, switch back to the projects grid
+      if (location.href.includes('/projects/view/')) {
+        const myProj = [...document.querySelectorAll('a, button, div, span')]
+          .find((el) => (el.innerText || '').trim() === 'My Projects');
+        if (myProj) myProj.click();
+        else {
+          const logo = document.querySelector('a[class*="header_clarityLogo"]');
+          if (logo) logo.click();
+        }
       }
 
-      const SITE = /^(?:https?:\\/\\/)?(?:www\\.)?[a-z0-9-]+(?:\\.[a-z0-9-]+)+(?:\\/\\S*)?$/i;
-      const readLines = () => String(document.body ? document.body.innerText || '' : '')
-        .split('\\n').map((l) => l.trim()).filter(Boolean);
-
-      const ids = new Set();
-      const harvest = () => {
-        const html = document.documentElement.outerHTML;
-        for (const m of html.matchAll(/projects\\/view\\/([a-z0-9]{6,20})/gi)) ids.add(m[1]);
-        // Bounded fiber scan: the grid has no per-card href, and an unbounded
-        // querySelectorAll('*') walk over it freezes the renderer.
-        const nodes = [...document.querySelectorAll('[class*=card i],[class*=project i],li,article')].slice(0, 800);
-        for (const el of nodes) {
-          for (const k of Object.keys(el)) {
-            if (k.charCodeAt(0) !== 95 || !k.startsWith('__react')) continue;
-            let j = '';
-            try { j = JSON.stringify(el[k]); } catch (e) { j = ''; }
-            for (const m of String(j).matchAll(/"(?:id|projectId|pid)":"([a-z0-9]{8,14})"/gi)) ids.add(m[1]);
+      // Settle on the project cards. Each card carries data-clarity-id="projectClicked_<projectId>"
+      let prevCount = -1;
+      let stableRounds = 0;
+      while (Date.now() < deadline) {
+        const cards = [...document.querySelectorAll('[data-clarity-id^="projectClicked_"]')];
+        if (cards.length > 0) {
+          if (cards.length === prevCount) {
+            stableRounds += 1;
+            if (stableRounds >= 2) {
+              const projects = cards.map((c) => {
+                const id = c.dataset.clarityId.replace('projectClicked_', '');
+                const lines = (c.innerText || '').split('\\n').map((s) => s.trim()).filter(Boolean);
+                return {
+                  ProjectId: id,
+                  Name: lines[0] || '',
+                  Site: lines[1] || '',
+                };
+              });
+              return { settled: true, projects, count: projects.length };
+            }
+          } else {
+            stableRounds = 0;
           }
+          prevCount = cards.length;
+        } else if (location.href.includes('/projects/view/')) {
+          const myProj = [...document.querySelectorAll('a, button, div, span')]
+            .find((el) => (el.innerText || '').trim() === 'My Projects');
+          if (myProj) myProj.click();
         }
-        return html.length;
-      };
+        await sleep(750);
+      }
 
-      // Settle before reporting. A grid still mounting yields a partial id set,
-      // and a partial set is worse than none: the caller cannot tell 3-of-20
-      // from 3-in-total, and reports the short list as the whole account.
-      let htmlLen = 0, prev = -1, stable = 0;
-      const settleBy = Date.now() + 15000;
-      while (Date.now() < settleBy) {
-        lines = readLines();
-        if (/sign in|log in|welcome to clarity/i.test(document.title + ' ' + lines.join(' '))) {
-          return { notSignedIn: true, href: location.href, title: document.title, ids: [], cardLines: 0, lines: [] };
-        }
-        htmlLen = harvest();
-        const cardLines = lines.filter((l) => SITE.test(l)).length;
-        if (ids.size > 0 && ids.size === prev && ids.size >= cardLines) {
-          stable += 1;
-          if (stable >= 2) break;
-        } else {
-          stable = 0;
-        }
-        prev = ids.size;
-        await sleep(800);
+      // Check for signed-out state only if polling deadline expired without cards
+      const bodyText = document.body ? document.body.innerText : '';
+      if (/sign in|log in|welcome to clarity/i.test(document.title + ' ' + bodyText)) {
+        return { notSignedIn: true, projects: [] };
+      }
+
+      // Fallback: if data-clarity-id is absent in future markup, use bounded fiber scan
+      const html = document.documentElement.outerHTML;
+      const ids = new Set();
+      for (const m of html.matchAll(/projects\\/view\\/([a-z0-9]{6,20})/gi)) ids.add(m[1]);
+      const SITE = /^(?:https?:\\/\\/)?(?:www\\.)?[a-z0-9-]+(?:\\.[a-z0-9-]+)+(?:\\/\\S*)?$/i;
+      const lines = String(document.body ? document.body.innerText || '' : '')
+        .split('\\n').map((l) => l.trim()).filter(Boolean);
+      const pairs = [];
+      for (let i = 0; i < lines.length - 1; i += 1) {
+        if (SITE.test(lines[i + 1]) && !SITE.test(lines[i])) pairs.push({ name: lines[i], site: lines[i + 1] });
       }
 
       return {
-        ids: [...ids],
-        cardLines: lines.filter((l) => SITE.test(l)).length,
-        lines: lines.slice(0, 400),
+        settled: false,
+        projects: [...ids].map((id, index) => ({
+          ProjectId: id,
+          Name: pairs[index] ? pairs[index].name : '',
+          Site: pairs[index] ? pairs[index].site : '',
+        })),
+        count: ids.size,
         href: location.href,
         title: document.title || '',
-        htmlLen,
+        lines: lines.slice(0, 100),
       };
     })()`);
+    } catch (err) {
+      if (err instanceof CommandExecutionError && err.message.includes('not signed in')) {
+        throw err;
+      }
+      if (isRetriableNavigationError(err) && attempt < 2) {
+        await new Promise((r) => setTimeout(r, 1000));
+        await safeGoto(page, `${CLARITY_ORIGIN}/projects`, { waitUntil: 'domcontentloaded' });
+        continue;
+      }
+      throw err;
+    }
     last = payload;
 
     if (payload?.notSignedIn) {
@@ -334,30 +379,14 @@ export async function discoverProjects(page) {
       );
     }
 
-    // A short list must never be returned as the whole account. If fewer ids
-    // than rendered cards came back, treat the sample as incomplete and retry.
-    if (payload && Array.isArray(payload.ids) && payload.ids.length > 0
-        && payload.ids.length >= (payload.cardLines || 0)) {
-      // The grid renders each card as "<Name>" then "<site url>" on the next
-      // line. Pair them in order; fall back to id-only when the text is short.
-      const SITE = /^(?:https?:\/\/)?(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/\S*)?$/i;
-      const pairs = [];
-      const lines = payload.lines || [];
-      for (let i = 0; i < lines.length - 1; i += 1) {
-        if (SITE.test(lines[i + 1]) && !SITE.test(lines[i])) pairs.push({ name: lines[i], site: lines[i + 1] });
-      }
-      return payload.ids.map((id, index) => ({
-        ProjectId: id,
-        Name: pairs[index] ? pairs[index].name : '',
-        Site: pairs[index] ? pairs[index].site : '',
-      }));
+    if (payload && Array.isArray(payload.projects) && payload.projects.length > 0) {
+      return payload.projects;
     }
   }
 
   throw new CommandExecutionError(
     'Could not read any project id from the Clarity projects grid. ' +
-    `Landed on ${last && last.href} (title="${last && last.title}", html=${last && last.htmlLen}B, ` +
-    `${last && last.lines ? last.lines.length : 0} lines). First lines: ${last && last.lines ? last.lines.slice(0, 20).join(' | ').slice(0, 300) : ''}. ` +
+    `Landed on ${last && last.href} (title="${last && last.title}"). ` +
     'Pass ids explicitly instead: opencli clarity audit --project-ids <a,b,c>',
   );
 }

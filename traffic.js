@@ -1,6 +1,6 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { CommandExecutionError } from '@jackwener/opencli/errors';
-import { CLARITY_ORIGIN, discoverProjects, normalizeProjectId, safeGoto } from './_ui.js';
+import { CLARITY_ORIGIN, discoverProjects, parseProjectIds, safeGoto } from './_ui.js';
 
 const DEFAULT_RANGE = 'Last 30 days';
 
@@ -26,11 +26,12 @@ async function readDashboard(page, projectId, range) {
     // and an early read returns the skeleton, whose metric tiles are absent —
     // which the parser would report as a confident zero.
     let lines = [], prev = -1, stable = 0;
-    const deadline = Date.now() + 40000;
+    const deadline = Date.now() + 15000;
     while (Date.now() < deadline) {
       lines = read();
       if (/sign in|welcome to clarity/i.test(document.title)) break;
       if (/gettingstarted|getting-started/i.test(location.href)) break;
+      if (/doesn't exist|don't have permissions|access denied|project not found/i.test(lines.join(' '))) break;
       if (lines.length > 20 && lines.includes('Sessions') && lines.length === prev) {
         stable += 1;
         if (stable >= 2) break;
@@ -38,7 +39,7 @@ async function readDashboard(page, projectId, range) {
         stable = 0;
       }
       prev = lines.length;
-      await sleep(1500);
+      await sleep(800);
     }
 
     const idx = (label) => lines.findIndex((l) => l === label);
@@ -83,6 +84,11 @@ async function readDashboard(page, projectId, range) {
       + 'Sign in at https://clarity.microsoft.com in that Chrome profile, then retry.',
     );
   }
+  if (/doesn't exist|don't have permissions|access denied|project not found/i.test(out.sample + ' ' + (out.title || ''))) {
+    throw new CommandExecutionError(
+      `NOT_FOUND: Clarity reported that project ${projectId} does not exist or this account lacks permissions to view it.`,
+    );
+  }
   if (!out.settled || !out.sessions) {
     throw new CommandExecutionError(
       `Clarity dashboard did not settle for ${projectId} at ${out.href} — `
@@ -107,6 +113,31 @@ export function toCount(raw) {
   return Number(s);
 }
 
+export function computeTrafficVerdict({ data, readError = '', range = DEFAULT_RANGE }) {
+  if (readError.startsWith('NOT_INSTALLED:')) {
+    // Clarity holding nothing is a fact about Clarity, not about the site.
+    return 'not measured: Clarity tag never fired — this says nothing about whether the site has visitors';
+  }
+  if (readError.startsWith('NOT_FOUND:')) {
+    return 'not found: project does not exist or no permission';
+  }
+  if (readError.includes('ignored the requested date range')) {
+    return `unknown: unrecognised date range "${range}"`;
+  }
+  if (readError) {
+    return `unknown: ${readError}`;
+  }
+
+  const sessions = data ? toCount(data.sessions) : null;
+  if (sessions === null) {
+    return `unknown: sessions tile read as "${data?.sessions}", not a plain count`;
+  }
+  if (sessions === 0) {
+    return `no traffic: 0 sessions in ${range}`;
+  }
+  return `active: ${sessions} sessions`;
+}
+
 export const trafficCommand = cli({
   site: 'clarity',
   name: 'traffic',
@@ -126,10 +157,10 @@ export const trafficCommand = cli({
   func: async (page, kwargs) => {
     const range = String(kwargs.range || DEFAULT_RANGE).trim();
 
+    const explicitIds = parseProjectIds(kwargs['project-ids']);
     let targets;
-    const explicit = String(kwargs['project-ids'] || '').trim();
-    if (explicit) {
-      targets = explicit.split(',').map((s) => ({ ProjectId: normalizeProjectId(s.trim()), Name: '' }));
+    if (explicitIds.length) {
+      targets = explicitIds.map((id) => ({ ProjectId: id, Name: '' }));
     } else {
       targets = await discoverProjects(page);
     }
@@ -145,25 +176,18 @@ export const trafficCommand = cli({
           readError = '';
         } catch (error) {
           readError = String(error && error.message ? error.message : error).slice(0, 300);
-          if (readError.startsWith('NOT_INSTALLED:')) break;
+          if (
+            readError.startsWith('NOT_INSTALLED:') ||
+            readError.startsWith('NOT_FOUND:') ||
+            readError.includes('ignored the requested date range') ||
+            /not signed in/i.test(readError)
+          ) {
+            break;
+          }
         }
       }
 
-      const sessions = data ? toCount(data.sessions) : null;
-
-      let verdict;
-      if (readError.startsWith('NOT_INSTALLED:')) {
-        // Clarity holding nothing is a fact about Clarity, not about the site.
-        verdict = 'not measured: Clarity tag never fired — this says nothing about whether the site has visitors';
-      } else if (readError) {
-        verdict = `unknown: ${readError}`;
-      } else if (sessions === null) {
-        verdict = `unknown: sessions tile read as "${data.sessions}", not a plain count`;
-      } else if (sessions === 0) {
-        verdict = `no traffic: 0 sessions in ${range}`;
-      } else {
-        verdict = `active: ${sessions} sessions`;
-      }
+      const verdict = computeTrafficVerdict({ data, readError, range });
 
       rows.push({
         ProjectId: projectId,

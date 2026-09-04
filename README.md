@@ -161,16 +161,19 @@ recovered, swapping these commands to GraphQL would remove the page loads.
   polling for a marker. (`page.wait` does exist on this page object — an early
   guess that it did not was wrong, and cost a debugging round. The real cause of
   the blank reads was the signed-out context above.)
-- **Project ids are not in the markup.** The grid renders no `<a href>` per
-  card; navigation is a JS handler. Ids come from React fiber props, scanned
-  over a **bounded** node set — an unbounded `querySelectorAll('*')` walk over
-  this grid freezes the renderer.
-- `/projects` navigation is protected by `safeGoto`. Direct navigation to
-  `/projects` often triggers an SPA client redirect to the user's last-viewed
-  project dashboard (`/projects/view/<id>/dashboard`), and Chrome container
-  reuse can throw `Navigation rejected`. `safeGoto` recovers transparently
-  via in-page evaluation and new-tab fallback, and `discoverProjects` targets
-  the root `${CLARITY_ORIGIN}/` to boot directly into the full projects grid.
+- **Deterministic project discovery.** Each card on the Clarity grid renders
+  `data-clarity-id="projectClicked_<projectId>"`, pairing project ID, friendly name,
+  and site URL deterministically without fragile fiber inspection. If redirected to a
+  specific project dashboard, `discoverProjects` clicks "My Projects" to return to
+  the grid.
+- **Fast `NOT_FOUND` exit.** When navigating to a non-existent or unauthorized project
+  ID, Clarity renders `"This project doesn't exist or you don't have permissions to view it."`
+  without changing `location.href`. The adapter detects this within 1–2s and breaks
+  immediately, avoiding wasted second retry attempts.
+- **Navigation resilience (`safeGoto`).** Direct navigation often triggers SPA redirects
+  or container reuse that can throw `Navigation rejected`, `Detached while handling command`,
+  or `Debugger is not attached`. `safeGoto` recovers transparently via in-page evaluation,
+  settling delay, and new-tab fallback.
 - Clarity is usually installed **through GTM**, not as a static snippet, so you
   cannot recover a project id by fetching the site's HTML — none of 20 sites
   carried `clarity.ms/tag/<id>`.

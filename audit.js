@@ -1,5 +1,5 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { discoverProjects, gotoClaritySettings, normalizeProjectId, readIntegrationCards } from './_ui.js';
+import { discoverProjects, gotoClaritySettings, parseProjectIds, readIntegrationCards } from './_ui.js';
 
 const DEFAULT_REQUIRED = 'Google Analytics,Google Tag Manager';
 
@@ -10,6 +10,62 @@ export function statusOf(cards, name) {
   // offer that integration for this project. That is a third state: it is not
   // "Not Connected" (nothing to connect) and not "Unknown" (we did read it).
   return 'Not offered';
+}
+
+export function computeAuditVerdict({ cards, readError = '', required = [] }) {
+  if (readError.startsWith('NOT_INSTALLED:')) {
+    return 'not installed: Clarity has never received data from this site';
+  }
+  if (readError.startsWith('NOT_FOUND:')) {
+    return 'not found: project does not exist or no permission';
+  }
+  if (readError) {
+    return `unknown: ${readError}`;
+  }
+
+  const ga  = cards ? statusOf(cards, 'Google Analytics')    : 'Unknown';
+  const gtm = cards ? statusOf(cards, 'Google Tag Manager')  : 'Unknown';
+  const gad = cards ? statusOf(cards, 'Google Ads')          : 'Unknown';
+  const mad = cards ? statusOf(cards, 'Microsoft Ads')       : 'Unknown';
+
+  const byName = {
+    'google analytics': ga,
+    'google tag manager': gtm,
+    'google ads': gad,
+    'microsoft ads': mad,
+  };
+
+  const missing = [];
+  const notOffered = [];
+  const unknown = [];
+
+  for (const req of required) {
+    const status = byName[req.toLowerCase()] || 'Unknown';
+    if (/^not connected$/i.test(status)) missing.push(req);
+    else if (/^not offered$/i.test(status)) notOffered.push(req);
+    else if (!status || /^unknown$/i.test(status)) unknown.push(req);
+  }
+
+  if (missing.length) return `setup needed: ${missing.join(' + ')}`;
+  if (unknown.length) return `unknown: ${unknown.join(' + ')} not readable`;
+  if (notOffered.length) return `ok (${notOffered.join(' + ')} not offered for this project)`;
+  return 'ok';
+}
+
+export function relabelSignedOutRows(rows) {
+  const anySucceeded = rows.some((r) =>
+    r.Verdict.startsWith('ok') ||
+    r.Verdict.startsWith('setup') ||
+    r.Verdict.startsWith('not found')
+  );
+  if (!anySucceeded) return rows;
+
+  for (const row of rows) {
+    if (/not signed in/i.test(row.Verdict)) {
+      row.Verdict = 'no access: Clarity served its signed-out shell for this project while other projects in the same run read fine — the account likely cannot open it';
+    }
+  }
+  return rows;
 }
 
 export const auditCommand = cli({
@@ -33,10 +89,10 @@ export const auditCommand = cli({
     const required = String(kwargs.required || DEFAULT_REQUIRED)
       .split(',').map((s) => s.trim()).filter(Boolean);
 
+    const explicitIds = parseProjectIds(kwargs['project-ids']);
     let targets;
-    const explicit = String(kwargs['project-ids'] || '').trim();
-    if (explicit) {
-      targets = explicit.split(',').map((s) => ({ ProjectId: normalizeProjectId(s.trim()), Name: '' }));
+    if (explicitIds.length) {
+      targets = explicitIds.map((id) => ({ ProjectId: id, Name: '' }));
     } else {
       targets = await discoverProjects(page);
     }
@@ -56,6 +112,13 @@ export const auditCommand = cli({
           readError = '';
         } catch (error) {
           readError = String(error && error.message ? error.message : error).slice(0, 300);
+          if (
+            readError.startsWith('NOT_INSTALLED:') ||
+            readError.startsWith('NOT_FOUND:') ||
+            /not signed in/i.test(readError)
+          ) {
+            break;
+          }
         }
       }
 
@@ -64,18 +127,7 @@ export const auditCommand = cli({
       const gad = cards ? statusOf(cards, 'Google Ads')          : 'Unknown';
       const mad = cards ? statusOf(cards, 'Microsoft Ads')       : 'Unknown';
 
-      const byName = { 'Google Analytics': ga, 'Google Tag Manager': gtm, 'Google Ads': gad, 'Microsoft Ads': mad };
-      const missing = required.filter((r) => /^not connected$/i.test(byName[r] || ''));
-      const notOffered = required.filter((r) => /^not offered$/i.test(byName[r] || ''));
-      const unknown = required.filter((r) => !byName[r] || /^unknown$/i.test(byName[r]));
-
-      let verdict;
-      if (readError.startsWith('NOT_INSTALLED:')) verdict = 'not installed: Clarity has never received data from this site';
-      else if (readError) verdict = `unknown: ${readError}`;
-      else if (missing.length) verdict = `setup needed: ${missing.join(' + ')}`;
-      else if (unknown.length) verdict = `unknown: ${unknown.join(' + ')} not readable`;
-      else if (notOffered.length) verdict = `ok (${notOffered.join(' + ')} not offered for this project)`;
-      else verdict = 'ok';
+      const verdict = computeAuditVerdict({ cards, readError, required });
 
       rows.push({
         ProjectId: projectId,
@@ -88,18 +140,7 @@ export const auditCommand = cli({
       });
     }
 
-    // A "not signed in" reading is only credible if nothing else read either.
-    // When other projects in the same run succeeded, the session is fine and
-    // this project simply is not available to the account — a different fact,
-    // with a different fix (regain access, not sign in).
-    const anySucceeded = rows.some((r) => r.Verdict.startsWith('ok') || r.Verdict.startsWith('setup'));
-    if (anySucceeded) {
-      for (const row of rows) {
-        if (/not signed in/i.test(row.Verdict)) {
-          row.Verdict = 'no access: Clarity served its signed-out shell for this project while other projects in the same run read fine — the account likely cannot open it';
-        }
-      }
-    }
+    relabelSignedOutRows(rows);
 
     return kwargs['only-issues'] === true ? rows.filter((r) => !r.Verdict.startsWith('ok')) : rows;
   },
